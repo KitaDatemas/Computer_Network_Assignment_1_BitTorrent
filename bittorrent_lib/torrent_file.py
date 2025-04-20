@@ -1,7 +1,9 @@
 import os
 import bencodepy
 import hashlib
+import math
 from collections import OrderedDict
+import threading
 
 class TorrentFile:
     def __init__(self, filename: str, destination_dir: str = '', src_file: str = '', tracker_url: str = 'http://127.0.0.1:5000/announce') -> None:
@@ -13,16 +15,20 @@ class TorrentFile:
         self.file_dir = destination_dir
         self.raw_file_dir = src_file
         self.piece_length = 2**19  # 512 KB
+        self.torrent_file_dir = destination_dir
 
         self.downloaded_pieces = []
-        self.pieces_data = {}
+        self.downloaded = False
+        # self.file_lock = threading.Lock()
 
         if os.path.exists(src_file):  # Create a new file if that torrent file not exist
-            self.torrent_file_dir = destination_dir
-
+            # self.torrent_file_dir = destination_dir
+            self.downloaded = True
             self.file_frame = {}  # Dummy init
             self.create_torrent_file(src_file, tracker_url)
             self.magnet_text = self.get_magnet_text()
+        else:
+            self.prepare_empty_file()
 
         with open(destination_dir, 'rb') as f:
             data = f.read()
@@ -31,7 +37,7 @@ class TorrentFile:
             # print('data after decode: ', data)
             self.info_hash = hashlib.sha1(bencodepy.encode(data['info'])).digest()
 
-        self.not_downloaded_pieces = range(len(self.downloaded_pieces), self.get_nb_of_pieces())
+        self.not_downloaded_pieces = list(range(len(self.downloaded_pieces), self.get_nb_of_pieces()))
 
     def create_torrent_file(self, src_file: str, tracker_url: str = 'http://127.0.0.1:5000/announce'):
         # print('Create torrent file')
@@ -41,9 +47,12 @@ class TorrentFile:
                 'name': self.file_name,
                 'length': os.path.getsize(src_file),
                 'piece length': self.piece_length,
-                'pieces': self.generate_pieces(2**20)
+                # 'pieces': self.generate_pieces(2**19)
             }
         }
+
+        self.generate_pieces_data(2**19)
+
         with open(self.torrent_file_dir, 'wb') as torrent_file:
             torrent_file.write(bencodepy.encode(self.file_frame))
 
@@ -95,19 +104,27 @@ class TorrentFile:
     def get_magnet_text(self):
         return 'magnet:?xt=urn:btih:' + self.get_info_hash().hex() + '&dn=' + 'Tracker' + '&tr=' + self.file_frame['announce']
 
-    def generate_pieces(self, piece_length):
-        pieces = b''
-        piece_index = 0
-        with open(self.raw_file_dir, 'rb') as f:
-            while True:
-                piece = f.read(piece_length)
-                self.pieces_data[piece_index] = piece
-                if not piece:
-                    break
-                pieces += hashlib.sha1(piece).digest()
-                self.downloaded_pieces.append(piece_index)
-                piece_index += 1
-        return pieces
+    # def generate_pieces(self, piece_length):
+    #     pieces = b''
+    #     piece_index = 0
+    #     with open(self.raw_file_dir, 'rb') as f:
+    #         while True:
+    #             piece = f.read(piece_length)
+    #             if not piece:
+    #                 break
+    #             pieces += hashlib.sha1(piece).digest()
+    #             self.downloaded_pieces[piece_index] = piece
+    #             piece_index += 1
+    #     return pieces
+
+    def generate_pieces_data(self, piece_length):
+        for piece_index in range(self.get_nb_of_pieces()):
+            self.downloaded_pieces.append(piece_index)
+
+    def prepare_empty_file(self):
+        os.makedirs(os.path.dirname(self.raw_file_dir), exist_ok=True)
+        with open(self.raw_file_dir, 'wb') as f:
+            f.truncate(self.get_file_size())
 
     def insert_received_pieces(self, piece_index: int, pieces_data: bytes):
         """
@@ -116,14 +133,19 @@ class TorrentFile:
         :note:      This function is for peer that at initial not a seeder, when it receives a file's piece it must save in order to quickly get the pieces
         """
         # print('Wanted to insert piece: ', piece_index, '. With data: ', pieces_data)
+        # with self.file_lock:
         if piece_index not in self.downloaded_pieces:
             # print('Insert piece', piece_index)
-            self.pieces_data[piece_index] = pieces_data
+            with open(self.raw_file_dir, 'r+b') as f:
+                f.seek(piece_index * self.piece_length)
+                f.write(pieces_data)
+
             self.downloaded_pieces.append(piece_index)
+            self.not_downloaded_pieces.remove(piece_index)
 
     def get_torrent_content(self):
         try:
-            with open(self.get_torrent_file_path(), 'rb') as f:
+            with open(self.torrent_file_dir, 'rb') as f:
                 data = f.read()
             data = bencodepy.decode(data)
             data = self.ordered_to_dict(data)
@@ -133,11 +155,14 @@ class TorrentFile:
             print('Exception while taking file size from torrent file', e)
 
     def get_nb_of_pieces(self):
+        # with self.file_lock:
         data = self.get_torrent_content()
-        pieces = data['info']['pieces']
-        return len(pieces) // 20
+        pieces = math.ceil(data['info']['length'] / data['info']['piece length'])
+        # print('Number of pieces: ', pieces)
+        return pieces
 
     def get_downloaded_pieces_list(self):
+        # with self.file_lock:
         return self.downloaded_pieces
 
     def decode_bytes(self, obj):
@@ -162,19 +187,31 @@ class TorrentFile:
 
     def get_piece(self, piece_index: int):
         if piece_index < 0 or piece_index >= self.get_nb_of_pieces():
+            print('Invalid piece index')
             return None
-        if piece_index not in list(self.pieces_data.keys()):
+        if piece_index not in self.downloaded_pieces:
+            print('Not found piece in piece data index')
             return None
-        return self.pieces_data[piece_index]
+        with open(self.raw_file_dir, 'rb') as f:
+            f.seek(piece_index * self.piece_length)
+            data = f.read(self.piece_length)
+        return data
 
     def merge_all_pieces(self):
         # print('Downloaded pieces: ', self.downloaded_pieces, '. Number of pieces to be able to merge: ', self.get_nb_of_pieces())
         if len(self.downloaded_pieces) != self.get_nb_of_pieces():
             print('Warning: File is not downloaded enough pieces, so cannot merge')
             return
+        # with open(self.raw_file_dir, 'wb') as file:
+        #     for piece_idx in self.downloaded_pieces:
+        #         print('piece idx: ', piece_idx, '. data: ', self.downloaded_pieces[piece_idx])
+        #         file.write(self.downloaded_pieces[piece_idx])
+        self.downloaded = True
+        print('File downloaded successfully')
 
-        with open(self.raw_file_dir, 'wb') as file:
-            for piece_idx in self.downloaded_pieces:
-                file.write(self.pieces_data[piece_idx])
+    def is_downloaded(self):
+        return self.downloaded
 
-        print('Save successfully')
+    def get_nb_of_not_downloaded_pieces(self):
+        # with self.file_lock:
+        return len(self.not_downloaded_pieces)

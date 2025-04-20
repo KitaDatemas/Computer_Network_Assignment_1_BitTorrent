@@ -9,10 +9,12 @@ import random
 import string
 import select
 import pickle
+import math
 import time
 import bitarray
 
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bittorrent_lib.torrent_file import TorrentFile
 from collections import OrderedDict
 
@@ -40,8 +42,8 @@ class Peer:
         self.listen_ip = listen_ip
         self.port = listen_port
 
-        self.not_download_files = []  # List to store file hashes and paths
-        self.download_files = []
+        self.not_download_files = {}  # List to store file hashes and paths
+        self.download_files = {}
         self.seeder_swarm = {}
         self.leecher_swarm = {}
         self.sim_peer_id = sim_peer_id
@@ -51,6 +53,9 @@ class Peer:
         self.tcp_socket_conn.bind((self.listen_ip, self.port))
         self.tcp_socket_conn.listen()
 
+        self.downloading_queue_lock = threading.Lock()
+        self.downloading_queue = []
+
         # Create torrent file if it's not exist and then announce to the tracker
         if os.listdir(os.path.join(os.path.curdir, 'Sim', str(sim_peer_id), 'File', 'torrent_file')):  # Folder File is not empty
             for filename in os.listdir(os.path.join(os.path.curdir, 'Sim', str(sim_peer_id), 'File', 'torrent_file')):
@@ -58,10 +63,12 @@ class Peer:
                 torrent_path = os.path.join(os.path.curdir, 'Sim', str(sim_peer_id), 'File', 'torrent_file', filename)
                 # print('Source file: ', raw_path, ', Torrent path: ', torrent_path)
                 file = TorrentFile(filename.replace('.torrent', ''), torrent_path, raw_path, self.tracker_url)
-                if os.path.exists(raw_path):
-                    self.download_files.append(file)
+                print('file info hash: ', file.get_info_hash())
+                if file.is_downloaded():
+                    print('File name: ', filename, ' existed')
+                    self.download_files[file.get_info_hash()] = file
                 else:
-                    self.not_download_files.append(file)
+                    self.not_download_files[file.get_info_hash()] = file
                 self.announce_to_tracker(file, 'started')
 
         if os.listdir(os.path.join(os.path.curdir, 'Sim', str(sim_peer_id), 'File', 'Raw')):
@@ -70,15 +77,16 @@ class Peer:
                     raw_path = os.path.join(os.path.curdir, 'Sim', str(sim_peer_id), 'File', 'Raw', filename)
                     torrent_path = os.path.join(os.path.curdir, 'Sim', str(sim_peer_id), 'File', 'torrent_file', filename + '.torrent')
                     file = TorrentFile(filename.replace('.torrent', ''), torrent_path, raw_path, self.tracker_url)
-                    self.download_files.append(file)
+                    print('file info hash: ', file.get_info_hash())
+                    self.download_files[file.get_info_hash()] = file
                     self.announce_to_tracker(file, 'started')
 
     def announce_to_tracker_thread(self):
         while self.is_running:
-            for file in self.download_files:
-                self.announce_to_tracker(file, 'regular_check')
-            for file in self.not_download_files:
-                self.announce_to_tracker(file, 'regular_check')
+            for file_key in list(self.download_files.keys()):
+                self.announce_to_tracker(self.download_files[file_key], 'regular_check')
+            for file_key in list(self.not_download_files.keys()):
+                self.announce_to_tracker(self.not_download_files[file_key], 'regular_check')
             time.sleep(15)  # Every two minutes, the peer will update the list
 
     def announce_to_tracker(self, torrent_file: TorrentFile, event_type: str):
@@ -121,35 +129,6 @@ class Peer:
         rand_num = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
         return '-PeerID-' + rand_num
 
-    # def request_file(self, filename):
-    #     if len(self.not_download_files) <= 0:
-    #         print('Every file has been downloaded')
-    #         return
-    #
-    #     torrent_file = None
-    #
-    #     for file in self.not_download_files:
-    #         if file.get_torrent_file_name() == filename:
-    #             torrent_file = file
-    #
-    #     if torrent_file is None:
-    #         print('Cannot found torrent file with name: ', filename)
-    #         return
-    #
-    #     peer_list = self.select_peer(torrent_file.get_info_hash())
-    #
-    #     for peer_to_request in peer_list:
-    #         with socket.create_connection((peer_to_request['listen ip'], int(peer_to_request['port']))) as tcp_socket:
-    #             handshake_message = self.generate_handshake(peer_to_request['peer id'], torrent_file.get_info_hash())
-    #             tcp_socket.sendall(handshake_message)
-    #             response_data = tcp_socket.recv(68).decode()
-    #             if response_data is None:
-    #                 print('connection is closed by the target peer')
-    #                 return
-    #             else:
-    #                 print('Peer response:', response_data[''])
-    #             return response_data['peer response']
-
     def select_peer(self, info_hash: str, max_peers=10):
         seeder_list = self.seeder_swarm.get(info_hash, [])
         leecher_list = self.leecher_swarm.get(info_hash, [])
@@ -184,7 +163,7 @@ class Peer:
         return pstrlen + pstr + reserved + info_hash_handshake + peer_id_handshake
 
     def found_created_file(self, filename):
-        for file in self.download_files:
+        for file in list(self.download_files.values()):
             if filename == file.get_raw_file_name():
                 return True
         return False
@@ -224,106 +203,209 @@ class Peer:
                 else:
                     try:
                         if not peer_connections[sock]['handshake_done']:
+                            print('Receive handshake')
                             handshake = sock.recv(HANDSHAKE_MSG_SIZE)
-                            if len(handshake) < HANDSHAKE_MSG_SIZE:
-                                continue
-                            # Parse info_hash và peer_id từ handshake
-                            info_hash = handshake[28:48]
-                            handshake_peer_id = handshake[48:68]
-                            handshake = handshake[:48] + self.peer_id.encode()
-                            # print(f'Handshake from {handshake_peer_id.decode()} with info_hash {info_hash}')
-                            # Gửi lại handshake (giống như gương)
-                            sock.sendall(handshake)
-                            peer_connections[sock]['info_hash'] = info_hash
-                            peer_connections[sock]['peer_id'] = handshake_peer_id
-                            peer_connections[sock]['handshake_done'] = True
-                            for file in self.download_files:
-                                # print('peer connection info hash: ', peer_connections[sock]['info_hash'], '. file info hash: ', file.get_info_hash())
-                                if file.get_info_hash() == peer_connections[sock]['info_hash']:
-                                    # print('found matching file')
-                                    peer_connections[sock]['file'] = file
+                            if len(handshake) >= HANDSHAKE_MSG_SIZE:
+                                # Parse info_hash và peer_id từ handshake
+                                info_hash = handshake[28:48]
+                                handshake_peer_id = handshake[48:68]
+                                handshake = handshake[:48] + self.peer_id.encode()
+                                print(f'Handshake from {handshake_peer_id.decode()} with info_hash {info_hash}')
+                                # Gửi lại handshake (giống như gương)
+                                sock.sendall(handshake)
+                                peer_connections[sock]['info_hash'] = info_hash
+                                peer_connections[sock]['peer_id'] = handshake_peer_id
+                                peer_connections[sock]['handshake_done'] = True
+                                for file in list(self.download_files.values()):
+                                    # print('peer connection info hash: ', peer_connections[sock]['info_hash'], '. file info hash: ', file.get_info_hash())
+                                    if file.get_info_hash() == peer_connections[sock]['info_hash']:
+                                        # print('found matching file')
+                                        peer_connections[sock]['file'] = file
 
                         else:
                             # Sau handshake, xử lý các message bình thường như bitfield, request, v.v.
                             msg_len_bytes = sock.recv(4)
-                            if not msg_len_bytes:
-                                continue
-                            msg_len = int.from_bytes(msg_len_bytes, byteorder='big')
-                            msg_type = sock.recv(1)
-                            if msg_type == b'\x05':  # bitfield
-                                bitfield = sock.recv(msg_len - TCP_MESSAGE_ID_SIZE)
-                                # print(f"Received bitfield {bitfield}, sending our bitfield back...")
-                                response_bitfield = self.generate_bitfield_msg(peer_connections[sock]['file'])
-                                # print('Bitfield wanna response: ', response_bitfield)
-                                sock.sendall(response_bitfield)
+                            if msg_len_bytes:
+                                msg_len = int.from_bytes(msg_len_bytes, byteorder='big')
+                                msg_type = sock.recv(1)
+                                if msg_type == b'\x05':  # bitfield
+                                    bitfield = sock.recv(msg_len - TCP_MESSAGE_ID_SIZE)
+                                    # print(f"Received bitfield {bitfield}, sending our bitfield back...")
+                                    response_bitfield = self.generate_bitfield_msg(peer_connections[sock]['file'])
+                                    # print('Bitfield wanna response: ', response_bitfield)
+                                    sock.sendall(response_bitfield)
 
-                            elif msg_type == b'\x02':  # interested
-                                # print("Peer is interested.")
-                                sock.sendall(self.generate_is_choke_msg(False))  # unchoke
-                            elif msg_type == b'\x06':  # request
-                                payload = sock.recv(msg_len - 1)
-                                index = int.from_bytes(payload[:4], byteorder='big')
-                                begin = int.from_bytes(payload[4:8], byteorder='big')
-                                length = int.from_bytes(payload[8:12], byteorder='big')
+                                elif msg_type == b'\x02':  # interested
+                                    print("Peer is interested.")
+                                    sock.sendall(self.generate_is_choke_msg(False))  # unchoke
+                                elif msg_type == b'\x06':  # request
+                                    payload = sock.recv(msg_len - 1)
+                                    index = int.from_bytes(payload[:4], byteorder='big')
+                                    begin = int.from_bytes(payload[4:8], byteorder='big')
+                                    length = int.from_bytes(payload[8:12], byteorder='big')
 
-                                info_hash = peer_connections[sock]['info_hash']
-                                for file in self.download_files:
-                                    if file.get_info_hash() == info_hash:
-                                        piece_data = file.get_piece(index)
+                                    info_hash = peer_connections[sock]['info_hash']
+                                    if info_hash in self.download_files:
+                                        # print('Search for files with info hash: ', info_hash, '. At file info hash: ', file.get_info_hash())
+                                        # if file.get_info_hash() == info_hash:
+                                        piece_data = self.download_files[info_hash].get_piece(index)
+                                        # print('found matching piece')
                                         if piece_data is not None:
                                             # print('data of piece: ', piece_data)
                                             piece_msg = self.generate_piece_msg(index, begin, piece_data)
                                             sock.sendall(piece_msg)
-                                            # print(f'Sent piece {index} to peer')
-                                        break
+                                            print(f'Sent piece {index} to peer ', peer_connections[sock]['peer_id'])
+                                        continue
                     except Exception as e:
-                        print(f"Connection error: {e}")
-                        inputs.remove(sock)
-                        del peer_connections[sock]
-                        sock.close()
+                        print(f"[SEEDER ERROR] Exception with peer {peer_connections.get(sock, {}).get('peer_id', 'unknown')}: {e}")
+                        if sock in inputs:
+                            inputs.remove(sock)
+                        if sock in peer_connections:
+                            del peer_connections[sock]
+                        try:
+                            sock.close()
+                        except Exception as close_err:
+                            print(f"[SEEDER ERROR] Failed to close socket: {close_err}")
+            time.sleep(0.1)
 
     def main_thread(self):
         while not stop_event.is_set():
             if keyboard.is_pressed('r'):
                 self.request_for_files()
+            time.sleep(0.1)
 
     def request_for_files(self):
-        print('Searching for not downloaded files')
-        for file in self.not_download_files:
+        print('Searching for not downloaded files: ', self.not_download_files)
+        for file in list(self.not_download_files.values()):
             print('Download file: ', file.get_raw_file_name())
             start_time = time.time()
             self.announce_to_tracker(file, 'started')
             file_info_hash = file.get_info_hash()
+            print('request info hash: ', file_info_hash)
             peer_list = self.select_peer(file_info_hash)
-            # print('Peer list: ', peer_list)
-            for peer_to_request in peer_list:
-                # print('Search at peer: ', peer_to_request)
-                conn = socket.create_connection((peer_to_request['listen ip'], peer_to_request['port']))  # Connect to target peer using its ip and port
-                handshake_msg = self.generate_handshake(file_info_hash)
-                conn.sendall(handshake_msg)
-                conn.settimeout(2)
-                try:
-                    handshake_msg_response = conn.recv(HANDSHAKE_MSG_SIZE)
-                except socket.timeout:
-                    print('Connection to peer timed out. Skip to next peer')
-                if handshake_msg_response is None:  # If the peer is not having the file then it will close the connection and the response is None => Skip to next peer
-                    continue
-                piece_list = self.handle_bitfield_flow_control(conn, file)
-                error_code = self.send_interest_and_receive_unchoke(conn)
-                if error_code != 0:  # Handle choke message received
-                    continue  # Skip to next peer
-                piece_receive, error_code = self.request_for_pieces(conn, file, piece_list)
-                for piece_idx in list(piece_receive.keys()):
-                    # print('Piece received: ', piece_idx, '. With data: ', piece_receive[piece_idx])
-                    file.insert_received_pieces(piece_idx, piece_receive[piece_idx])
-                if error_code == 0:  # Downloaded all the pieces
-                    print('     Downloaded time: ', time.time() - start_time)
-                    self.announce_to_tracker(file, 'completed')
-                    break
 
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [
+                    executor.submit(self.request_for_file_thread, peer_to_request, file, file_info_hash)
+                    for peer_to_request in peer_list
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Thread error: {e}")
+
+            print('     Downloaded time: ', time.time() - start_time)
+            self.announce_to_tracker(file, 'completed')
             file.merge_all_pieces()
-            self.not_download_files.remove(file)
-            self.download_files.append(file)
+            del self.not_download_files[file.get_info_hash()]
+            self.download_files[file.get_info_hash()] = file
+
+    def request_for_file_thread(self, peer_to_request: dict, file: TorrentFile, file_info_hash):
+        conn = socket.create_connection((peer_to_request['listen ip'], peer_to_request['port'])) # Connect to target peer using its ip and port
+        handshake_msg = self.generate_handshake(file_info_hash)
+        conn.sendall(handshake_msg)
+        conn.settimeout(1)
+        try:
+            handshake_msg_response = conn.recv(HANDSHAKE_MSG_SIZE)
+        except socket.timeout:
+            print('Connection to peer timed out. Skip to next peer')
+        if not handshake_msg_response:  # If the peer is not having the file then it will close the connection and the response is None => Skip to next peer
+            conn.close()
+            return
+        piece_list = self.handle_bitfield_flow_control(conn, file)
+        error_code = self.send_interest_and_receive_unchoke(conn)
+        if error_code != 0:  # Handle choke message received
+            conn.close()
+            return  # Skip to next peer
+
+        piece_receive = {}
+        while file.get_nb_of_not_downloaded_pieces() > 0:
+            # self.downloading_queue_lock.acquire()
+            is_valid = False
+            piece = -1  # Dummy init
+            with self.downloading_queue_lock:
+                # print('Thread id: ', threading.get_ident(), '. Not download list: ', file.not_downloaded_pieces, '. Nb of piece in not download piece list: ', file.get_nb_of_not_downloaded_pieces())
+                if file.get_nb_of_not_downloaded_pieces() > 1:
+                    piece = random.randint(0, file.get_nb_of_not_downloaded_pieces() - 1)
+                elif file.get_nb_of_not_downloaded_pieces() == 1:
+                    piece = 0
+                # print('Thread id: ', threading.get_ident(), '. Piece to check: ', piece)
+                if piece != -1:
+                    # print('Thread id: ', threading.get_ident(), 'Piece idx to request: ', piece)
+                    try:
+                        piece = file.not_downloaded_pieces[piece]
+                    except IndexError:
+                        print('Thread id: ', threading.get_ident(), 'Piece idx error to request: ', piece, '. Current not download pieces list: ', file.not_downloaded_pieces)
+
+                    if piece not in self.downloading_queue:
+                        self.downloading_queue.append(piece)
+                        is_valid = True
+
+            if is_valid:
+                # print('Thread id: ', threading.get_ident(), 'Request piece ', piece)
+                piece_receive, error_code = self.request_for_piece(piece, conn, file)
+                # print('Piece received: ', piece_idx, '. With data: ', piece_receive[piece_idx])
+                if error_code != 0:
+                    print('Receive error')
+                    continue
+                file.insert_received_pieces(piece, piece_receive)
+                with self.downloading_queue_lock:
+                    self.downloading_queue.remove(piece)
+        conn.close()
+
+    def request_for_piece(self, request_piece_idx: int, conn, torrent_file: TorrentFile):
+        """
+        :note: This function is for request for pieces of not downloaded file
+        :param torrent_file:
+        :param piece_list:
+        :return: 0: If all pieces are downloaded
+        """
+        print(f'\rDownload progress: {torrent_file.get_nb_of_pieces() - torrent_file.get_nb_of_not_downloaded_pieces()}/{torrent_file.get_nb_of_pieces()}', end='')
+        request_msg = self.generate_request_msg(request_piece_idx, torrent_file.get_piece_length())
+        conn.sendall(request_msg)  # Send request message for wanted piece
+
+        conn.settimeout(1)  # Set timeout for receiving 1 second
+        try:
+            piece_len = int.from_bytes(conn.recv(TCP_MESSAGE_SIZE), 'big')
+            message_type_id = int.from_bytes(conn.recv(TCP_MESSAGE_ID_SIZE), 'big')
+            if message_type_id != PIECE_ID:  # If the message is not response message
+                print('\nRequest message receive a message of wrong type (Not piece message) with message type: ', message_type_id)
+                return b'', -1
+            try:
+                piece_index = int.from_bytes(conn.recv(4), 'big')
+            except Exception as e:
+                print('\nError at request for piece: ', e)
+            try:
+                piece_offset = int.from_bytes(conn.recv(4), 'big')
+            except Exception as e:
+                print('\nError at receive piece offset: ', e)
+            remain_size = piece_len - TCP_MESSAGE_ID_SIZE - 4 - 4
+            data = b''
+        except socket.timeout:
+            print('Connection suddenly closed when request for piece')
+            return b'', -1
+
+        while remain_size > 0:
+            try:
+                piece_chunk = conn.recv(remain_size)
+            except MemoryError as e:
+                print('\nMemory error with error: ', e, '. Remain size: ', remain_size)
+            if piece_chunk is None:
+                raise ValueError('\nConnection suddenly closed')
+            # print('Piece chunk received: ', piece_chunk)
+            data += piece_chunk
+            # print('data received: ', data)
+            remain_size -= len(piece_chunk)
+
+        if len(data) == 0:
+            print('len data = 0')
+            return b'', -1
+        # mark = self.process_bar(torrent_file, piece_receive)
+        # print(f"\rDownload status:  [{'-' * mark + ' ' * (20 - mark)}]", end='')
+
+        return data, 0
+
 
     def process_bar(self, file, piece_list: list):
         return (int(len(piece_list) / float(file.get_nb_of_pieces()) * 20))
@@ -401,48 +483,6 @@ class Peer:
         message_len = (len(message_type_id) + len(piece_index) + len(begin_offset) + len(data)).to_bytes(4, byteorder='big')
         return message_len + message_type_id + piece_index + begin_offset + data
 
-    def request_for_pieces(self, conn, torrent_file: TorrentFile, piece_list: list[int]):
-        """
-        :note: This function is for request for pieces of not downloaded file
-        :param torrent_file:
-        :param piece_list:
-        :return: 0: If all pieces are downloaded
-        """
-        piece_receive = {}
-        for piece in piece_list:
-            # print('Traverse at piece: ', piece)
-            if not torrent_file.have_piece(piece):
-                request_msg = self.generate_request_msg(piece, torrent_file.get_piece_length())
-                conn.sendall(request_msg)  # Send request message for wanted piece
-
-                conn.settimeout(1)  # Set timeout for receiving 1 second
-                try:
-                    piece_len = int.from_bytes(conn.recv(TCP_MESSAGE_SIZE), 'big')
-                    message_type_id = int.from_bytes(conn.recv(TCP_MESSAGE_ID_SIZE), 'big')
-                    if message_type_id != PIECE_ID:  # If the message is not response message
-                        raise ValueError('Request message receive a message of wrong type (Not piece message)')
-                    piece_index = int.from_bytes(conn.recv(4), 'big')
-                    piece_offset = int.from_bytes(conn.recv(4), 'big')
-                    remain_size = piece_len - TCP_MESSAGE_ID_SIZE - 4 - 4
-                    data = b''
-                except socket.timeout:
-                    print('Connection suddenly closed when request for piece')
-
-                while remain_size > 0:
-                    piece_chunk = conn.recv(remain_size)
-                    if piece_chunk is None:
-                        raise ValueError('Connection suddenly closed')
-                    data += piece_chunk
-                    # print('data received: ', data)
-                    remain_size -= len(piece_chunk)
-
-                if len(data) > 0:
-                    piece_receive[piece] = data
-                mark = self.process_bar(torrent_file, piece_receive)
-                print(f"\rDownload status:  [{'-' * mark + ' ' * (20 - mark)}]", end='')
-
-        return piece_receive, 0
-
     def send_interest_and_receive_unchoke(self, conn):
         """
         :note:          This function is for send interest and receive unchoke message
@@ -450,7 +490,7 @@ class Peer:
         """
         interest_msg = self.generate_is_interest_msg(True)
         conn.sendall(interest_msg)
-        conn.settimeout(20)
+        conn.settimeout(0.5)
         try:
             message_len = int.from_bytes(conn.recv(TCP_MESSAGE_SIZE), 'big')
             if message_len != 1:  # Handle unexpected error like not a unchoke or choke message
@@ -468,8 +508,8 @@ class Peer:
         return 0
 
     def find_files_in_file_list(self, info_hash: str):
-        for file in self.download_files:
-            if file.compare_info_hash(info_hash):
+        for file_info_hash in list(self.download_files.keys()):
+            if info_hash == file_info_hash:
                 print('File found')
 
 
@@ -481,7 +521,7 @@ if __name__ == '__main__':
 
     threads_pool = []
     peer = Peer(listen_ip='127.0.0.1', listen_port=port, sim_peer_id=peer_id)
-    threads_pool.append(threading.Thread(target=peer.announce_to_tracker_thread))
+    # threads_pool.append(threading.Thread(target=peer.announce_to_tracker_thread))
     threads_pool.append(threading.Thread(target=peer.handle_peer_request))
     threads_pool.append(threading.Thread(target=peer.main_thread))
 

@@ -9,11 +9,10 @@ This is a BitTorrent client simulation supporting basic torrenting operations: t
 
 ```
 .
-├── BitTorrent_CLI.py       # Main entry CLI to control and run all commands
-├── Peer.py                 # Logic for peers (seeders and leechers)
-├── Tracker.py              # Tracker server handling peer announcements
-├── torrent_file.py         # Torrent file creation and parsing logic
-└── Sim/                    # Contains simulation peers and file storage
+├── keyboard
+├── bencodepy
+├── bitarray
+├── requests
 ```
 
 ---

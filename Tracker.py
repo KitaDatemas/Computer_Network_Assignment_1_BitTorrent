@@ -46,7 +46,12 @@ class Tracker:
             self.peer_swarms[data.get('info_hash')][data.get('peer id')] = peer
             return jsonify({})
         elif data.get('event') == 'stopped':
-            pass
+            if data.get('info_hash') in self.peer_swarms:
+                if data.get('peer id') in self.peer_swarms[data.get('info_hash')]:
+                    del self.peer_swarms[data.get('info_hash')][data.get('peer id')]
+                    if len(self.peer_swarms[data.get('info_hash')]) == 0:
+                        del self.peer_swarms[data.get('info_hash')]
+            return jsonify({})
         elif data.get('event') == 'regular_check':
             if data.get('info_hash') in self.peer_swarms:
                 if data.get('peer id') in self.peer_swarms[data.get('info_hash')]:

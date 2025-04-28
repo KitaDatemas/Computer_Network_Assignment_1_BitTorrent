@@ -27,7 +27,7 @@ def find_all_torrent_files_name(id: int):
             file_found = True
             
     if not file_found:
-        print('\033[31mNo torrent file found')
+        print('\033[31m\tNo torrent file found')
 
 def find_torrent_file(path, raw_path, torrent_file_name):
     if os.path.exists(path):
